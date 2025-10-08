@@ -1,0 +1,16 @@
+services:
+  - type: web
+    name: bilingual-asr-backend
+    env: docker
+    plan: free
+    repo: https://github.com/<you>/bi-asr-app
+    rootDir: backend
+    envVars:
+      - key: OPENAI_API_KEY
+        sync: false
+      - key: SUPABASE_URL
+        sync: false
+      - key: SUPABASE_SERVICE_ROLE_KEY
+        sync: false
+      - key: CORS_ORIGINS
+        value: https://your-frontend.vercel.app
