@@ -1,146 +1,370 @@
-'use client';
+﻿'use client';
 
-import React, { useEffect, useRef, useState } from 'react';
+import React, { useEffect, useMemo, useRef, useState } from 'react';
 
-const BACKEND = process.env.NEXT_PUBLIC_BACKEND_URL as string;
+type Lang = 'en' | 'zh';
 
 type Segment = {
-  id: string;
-  lang: string;
-  startMs: number;
-  endMs: number;
-  text?: string;
+  id?: string;
+  language: Lang;
+  start_ms: number;
+  end_ms: number;
+  text: string | null;
+  audio_path?: string;
 };
 
 export default function Recorder() {
+  const backendBase = process.env.NEXT_PUBLIC_BACKEND_URL || 'http://localhost:8000';
+
   const [sessionId, setSessionId] = useState<string | null>(null);
-  const [recording, setRecording] = useState(false);
-  const [language, setLanguage] = useState<'en' | 'zh'>('en');
+  const [isRecording, setIsRecording] = useState(false);
+  const [language, setLanguage] = useState<Lang>('en');
+  const [status, setStatus] = useState<string>('');
   const [segments, setSegments] = useState<Segment[]>([]);
-  const mediaRecorderRef = useRef<MediaRecorder | null>(null);
-  const startTimeRef = useRef<number>(0);
-  const elapsedRef = useRef<number>(0);
-  const chunkIntervalMs = 2000; // 2s chunks
+  const [error, setError] = useState<string>('');
+
+  const mediaStreamRef = useRef<MediaStream | null>(null);
+  const recorderRef = useRef<MediaRecorder | null>(null);
+
+  const sessionStartPerfRef = useRef<number>(0);
+  const segmentStartMsRef = useRef<number>(0);
+
+  const segmentChunksRef = useRef<BlobPart[]>([]);
+  const hasAnyAudioRef = useRef<boolean>(false);
+
+  const canToggle = isRecording && !!sessionId;
 
   useEffect(() => {
     return () => {
-      if (mediaRecorderRef.current && mediaRecorderRef.current.state !== 'inactive') {
-        mediaRecorderRef.current.stop();
-      }
-    }
+      tryStopRecorder();
+      tryStopTracks();
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  async function ensureSession() {
-    if (sessionId) return sessionId;
-    const res = await fetch(`${BACKEND}/api/start-session`, {
+  function tryStopTracks() {
+    const stream = mediaStreamRef.current;
+    if (!stream) return;
+    for (const track of stream.getTracks()) track.stop();
+    mediaStreamRef.current = null;
+  }
+
+  function tryStopRecorder() {
+    const rec = recorderRef.current;
+    if (!rec) return;
+    if (rec.state !== 'inactive') rec.stop();
+    recorderRef.current = null;
+  }
+
+  function currentRelativeMs() {
+    return Math.max(0, Math.floor(performance.now() - sessionStartPerfRef.current));
+  }
+
+  async function safeText(res: Response) {
+    try {
+      return await res.text();
+    } catch {
+      return '';
+    }
+  }
+
+  async function startSession() {
+    const res = await fetch(`${backendBase}/api/start-session`, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ client_label: 'web-demo', user_agent: navigator.userAgent })
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        client_label: 'web',
+        user_agent: typeof navigator !== 'undefined' ? navigator.userAgent : null,
+        note: 'user-assisted bilingual ASR session',
+      }),
     });
+    if (!res.ok) throw new Error(`start-session failed: ${res.status}`);
     const data = await res.json();
-    setSessionId(data.session_id);
+    if (!data?.session_id) throw new Error('start-session missing session_id');
     return data.session_id as string;
   }
 
-  async function startRec() {
-    const sid = await ensureSession();
-    const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-    const mr = new MediaRecorder(stream, { mimeType: 'audio/webm' });
-    mediaRecorderRef.current = mr;
-    startTimeRef.current = performance.now();
+  async function endSession(sid: string) {
+    const res = await fetch(`${backendBase}/api/end-session`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ session_id: sid }),
+    });
+    if (!res.ok) throw new Error(`end-session failed: ${res.status}`);
+    return await res.json();
+  }
 
-    mr.ondataavailable = async (ev: BlobEvent) => {
-      if (ev.data && ev.data.size > 0) {
-        const now = performance.now();
-        const startMs = Math.floor(elapsedRef.current);
-        const endMs = Math.floor(startMs + chunkIntervalMs);
-        elapsedRef.current = endMs;
+  async function flushCurrentSegment(langForSegment: Lang) {
+    const sid = sessionId;
+    if (!sid) return;
 
-        const metadata = {
-          session_id: sid,
-          language_code: language,
-          start_ms: startMs,
-          end_ms: endMs,
-        };
+    const start_ms = segmentStartMsRef.current;
+    const end_ms = currentRelativeMs();
 
-        const fd = new FormData();
-        fd.append('metadata_json', JSON.stringify(metadata));
-        fd.append('file', ev.data, `chunk-${startMs}-${endMs}.webm`);
+    const parts = segmentChunksRef.current;
+    segmentChunksRef.current = [];
 
-        try {
-          const resp = await fetch(`${BACKEND}/api/upload-chunk`, { method: 'POST', body: fd });
-          const json = await resp.json();
-          setSegments(prev => [...prev, { id: json.segment_id, lang: language, startMs, endMs, text: json.text }]);
-        } catch (e) {
-          console.error('upload failed', e);
-        }
-      }
+    const hasAudio = hasAnyAudioRef.current;
+    hasAnyAudioRef.current = false;
+
+    const duration = end_ms - start_ms;
+    if (!hasAudio || parts.length === 0 || duration < 200) {
+      segmentStartMsRef.current = end_ms;
+      return;
+    }
+
+    const blob = new Blob(parts, { type: 'audio/webm' });
+    const meta = {
+      session_id: sid,
+      language_code: langForSegment,
+      start_ms,
+      end_ms,
     };
 
-    mr.start(chunkIntervalMs);
-    setRecording(true);
+    setStatus('uploading segment...');
+    setError('');
+
+    try {
+      const form = new FormData();
+      form.append('metadata_json', JSON.stringify(meta));
+      form.append('file', blob, `segment-${start_ms}-${end_ms}.webm`);
+
+      const res = await fetch(`${backendBase}/api/upload-chunk`, {
+        method: 'POST',
+        body: form,
+      });
+
+      if (!res.ok) {
+        const msg = await safeText(res);
+        throw new Error(`upload-chunk failed: ${res.status} ${msg}`);
+      }
+
+      const data = await res.json();
+
+      setSegments((prev) => [
+        ...prev,
+        {
+          id: data.segment_id,
+          language: langForSegment,
+          start_ms,
+          end_ms,
+          text: data.text ?? null,
+          audio_path: data.audio_path,
+        },
+      ]);
+    } catch (e: any) {
+      setError(e?.message || 'segment upload failed');
+      setSegments((prev) => [
+        ...prev,
+        {
+          language: langForSegment,
+          start_ms,
+          end_ms,
+          text: null,
+        },
+      ]);
+    } finally {
+      setStatus('');
+      segmentStartMsRef.current = end_ms;
+    }
   }
 
-  function stopRec() {
-    mediaRecorderRef.current?.stop();
-    mediaRecorderRef.current = null;
-    setRecording(false);
+  async function onStart() {
+    setError('');
+    setStatus('starting...');
+    setSegments([]);
+    setLanguage('en');
+
+    try {
+      const sid = await startSession();
+      setSessionId(sid);
+
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      mediaStreamRef.current = stream;
+
+      const rec = new MediaRecorder(stream, { mimeType: 'audio/webm' });
+      recorderRef.current = rec;
+
+      segmentChunksRef.current = [];
+      hasAnyAudioRef.current = false;
+
+      sessionStartPerfRef.current = performance.now();
+      segmentStartMsRef.current = 0;
+
+      rec.ondataavailable = (evt) => {
+        if (!evt.data || evt.data.size === 0) return;
+        hasAnyAudioRef.current = true;
+        segmentChunksRef.current.push(evt.data);
+      };
+
+      rec.onerror = () => {
+        setError('recorder error');
+      };
+
+      rec.start(250);
+      setIsRecording(true);
+      setStatus('');
+    } catch (e: any) {
+      setStatus('');
+      setError(e?.message || 'failed to start');
+      setIsRecording(false);
+      setSessionId(null);
+      tryStopRecorder();
+      tryStopTracks();
+    }
   }
 
-  async function endSession() {
-    if (!sessionId) return;
-    const res = await fetch(`${BACKEND}/api/end-session`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ session_id: sessionId })
-    });
-    const data = await res.json();
-    alert(`Final transcript for session\n\n${data.transcript || ''}`);
+  async function onToggleLanguage() {
+    if (!canToggle) return;
+
+    const currentLang = language;
+    const nextLang: Lang = currentLang === 'en' ? 'zh' : 'en';
+
+    setStatus('finalizing segment...');
+    await flushCurrentSegment(currentLang);
+
+    setLanguage(nextLang);
+    setStatus('');
   }
 
-  function toggleLanguage() {
-    setLanguage(prev => (prev === 'en' ? 'zh' : 'en'));
+  async function onStop() {
+    const sid = sessionId;
+    if (!sid) {
+      setIsRecording(false);
+      tryStopRecorder();
+      tryStopTracks();
+      return;
+    }
+
+    setStatus('stopping...');
+    setError('');
+
+    try {
+      await flushCurrentSegment(language);
+    } finally {
+      tryStopRecorder();
+      tryStopTracks();
+      setIsRecording(false);
+    }
+
+    try {
+      setStatus('ending session...');
+      await endSession(sid);
+    } catch {
+      // no-op
+    } finally {
+      setStatus('');
+      setSessionId(null);
+    }
   }
 
-  const transcript = segments
-    .sort((a, b) => a.startMs - b.startMs)
-    .map(s => `[${s.lang}] ${s.text || ''}`)
-    .join(' ');
+  const transcriptText = useMemo(() => {
+    return segments
+      .map((s) => {
+        const tag = s.language === 'en' ? '[EN]' : '[ZH]';
+        const t = s.text ?? '';
+        return `${tag} ${t}`.trim();
+      })
+      .filter(Boolean)
+      .join("\n");
+  }, [segments]);
+
+  const langLabel = language === 'en' ? 'English' : 'Mandarin';
+  const toggleLabel = language === 'en' ? 'Switch to Mandarin' : 'Switch to English';
 
   return (
-    <div style={{ display: 'grid', gap: 16 }}>
-      <h1>User‑Assisted Bilingual ASR</h1>
-      <div style={{ display: 'flex', gap: 8 }}>
-        {!recording ? (
-          <button onClick={startRec} style={{ padding: '8px 12px' }}>Start Recording</button>
+    <section style={{ padding: 16, border: '1px solid #ddd', borderRadius: 12 }}>
+      <h2 style={{ marginTop: 0 }}>User-Assisted Bilingual ASR</h2>
+
+      <div style={{ display: 'flex', gap: 12, alignItems: 'center', flexWrap: 'wrap' }}>
+        {!isRecording ? (
+          <button onClick={onStart} style={btn()}>
+            Start
+          </button>
         ) : (
-          <button onClick={stopRec} style={{ padding: '8px 12px' }}>Stop</button>
+          <button onClick={onStop} style={btn({ borderColor: '#c33' })}>
+            Stop
+          </button>
         )}
-        <button onClick={toggleLanguage} disabled={!recording} style={{ padding: '8px 12px' }}>
-          Language: {language.toUpperCase()} (click to switch)
+
+        <button onClick={onToggleLanguage} disabled={!canToggle} style={btn({ opacity: canToggle ? 1 : 0.5 })}>
+          {toggleLabel}
         </button>
-        <button onClick={endSession} disabled={!sessionId} style={{ padding: '8px 12px' }}>
-          End Session & Aggregate
-        </button>
+
+        <span style={{ color: '#444' }}>
+          Current language: <b>{langLabel}</b>
+        </span>
+
+        {sessionId ? (
+          <span style={{ color: '#666' }}>
+            Session: <code>{sessionId}</code>
+          </span>
+        ) : null}
       </div>
 
-      <div>
-        <h3>Live Transcript</h3>
-        <div style={{ whiteSpace: 'pre-wrap', border: '1px solid #ddd', padding: 12, borderRadius: 8, minHeight: 120 }}>
-          {transcript || '—'}
+      {status ? <p style={{ marginTop: 12, color: '#444' }}>{status}</p> : null}
+      {error ? <p style={{ marginTop: 12, color: '#b00' }}>{error}</p> : null}
+
+      <div style={{ marginTop: 16 }}>
+        <h3 style={{ marginBottom: 8 }}>Transcript</h3>
+        <textarea
+          value={transcriptText}
+          readOnly
+          rows={10}
+          style={{
+            width: '100%',
+            borderRadius: 10,
+            border: '1px solid #ddd',
+            padding: 12,
+            fontFamily: 'ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace',
+            fontSize: 13,
+            lineHeight: 1.4,
+          }}
+        />
+      </div>
+
+      <div style={{ marginTop: 16 }}>
+        <h3 style={{ marginBottom: 8 }}>Segments</h3>
+        <div style={{ display: 'grid', gap: 8 }}>
+          {segments.map((s, idx) => (
+            <div
+              key={`${idx}-${s.start_ms}-${s.end_ms}`}
+              style={{
+                border: '1px solid #eee',
+                borderRadius: 10,
+                padding: 10,
+                background: '#fafafa',
+              }}
+            >
+              <div style={{ display: 'flex', gap: 10, flexWrap: 'wrap', alignItems: 'center' }}>
+                <b>{s.language === 'en' ? 'EN' : 'ZH'}</b>
+                <span style={{ color: '#666' }}>
+                  {s.start_ms}ms to {s.end_ms}ms
+                </span>
+                {s.audio_path ? <code style={{ color: '#666' }}>{s.audio_path}</code> : null}
+              </div>
+              <div style={{ marginTop: 6, whiteSpace: 'pre-wrap' }}>{s.text ?? '(no transcript returned)'}</div>
+            </div>
+          ))}
+          {segments.length === 0 ? <div style={{ color: '#666' }}>No segments yet.</div> : null}
         </div>
       </div>
 
-      <div>
-        <h3>Segments</h3>
-        <ol>
-          {segments.map(s => (
-            <li key={s.id}>
-              <code>[{s.lang}] {s.startMs}–{s.endMs} ms</code> → {s.text || '…'}
-            </li>
-          ))}
-        </ol>
-      </div>
-    </div>
+      <p style={{ marginTop: 16, color: '#666' }}>
+        Recording is segmented only when I toggle languages or stop. Each segment is uploaded with an explicit language
+        label and stored for future bilingual dataset growth.
+      </p>
+    </section>
   );
+}
+
+function btn(opts?: { borderColor?: string; opacity?: number }) {
+  return {
+    padding: '10px 14px',
+    borderRadius: 10,
+    border: `1px solid ${opts?.borderColor || '#333'}`,
+    background: '#fff',
+    cursor: 'pointer',
+    opacity: opts?.opacity ?? 1,
+  } as React.CSSProperties;
 }

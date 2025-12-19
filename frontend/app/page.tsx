@@ -1,12 +1,12 @@
-import Recorder from './components/Recorder';
+﻿import Recorder from './components/Recorder';
 
 export default function Page() {
   return (
     <main>
       <Recorder />
       <p style={{ marginTop: 24, color: '#666' }}>
-        Tip: speak, then click the language button when you switch languages. The app sends ~2s chunks to the
-        backend, transcribes with a language hint, and stores audio + text for research.
+        Tip: start recording, then toggle the language button exactly when the language changes. Each toggle finalizes
+        a segment and sends it to the backend with an explicit language label for transcription and dataset storage.
       </p>
     </main>
   );
