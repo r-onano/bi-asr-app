@@ -1,4 +1,4 @@
-﻿'use client';
+'use client';
 
 import React, { useEffect, useMemo, useRef, useState } from 'react';
 
@@ -12,6 +12,24 @@ type Segment = {
   text: string | null;
   audio_path?: string;
 };
+
+function pickMimeType() {
+  const candidates = ['audio/webm;codecs=opus', 'audio/webm', 'audio/ogg;codecs=opus', 'audio/ogg'];
+  for (const t of candidates) {
+    if (typeof MediaRecorder !== 'undefined' && MediaRecorder.isTypeSupported(t)) return t;
+  }
+  return '';
+}
+
+function extFromMime(mimeType: string) {
+  if (mimeType.includes('ogg')) return 'ogg';
+  return 'webm';
+}
+
+function createRecorder(stream: MediaStream) {
+  const mimeType = pickMimeType();
+  return mimeType ? new MediaRecorder(stream, { mimeType }) : new MediaRecorder(stream);
+}
 
 export default function Recorder() {
   const backendBase = process.env.NEXT_PUBLIC_BACKEND_URL || 'http://localhost:8000';
@@ -94,13 +112,48 @@ export default function Recorder() {
     return await res.json();
   }
 
-  async function flushCurrentSegment(langForSegment: Lang) {
+  async function stopRecorderAndWait(rec: MediaRecorder) {
+    if (rec.state === 'inactive') return;
+
+    await new Promise<void>((resolve) => {
+      const onStop = () => {
+        rec.removeEventListener('stop', onStop);
+        resolve();
+      };
+      rec.addEventListener('stop', onStop);
+
+      try {
+        rec.requestData();
+      } catch {
+        // ignore
+      }
+
+      try {
+        rec.stop();
+      } catch {
+        rec.removeEventListener('stop', onStop);
+        resolve();
+      }
+    });
+  }
+
+  async function flushCurrentSegment(langForSegment: Lang, restartAfter: boolean) {
     const sid = sessionId;
-    if (!sid) return;
+    const rec = recorderRef.current;
+    const stream = mediaStreamRef.current;
+
+    if (!sid || !rec) return;
 
     const start_ms = segmentStartMsRef.current;
     const end_ms = currentRelativeMs();
 
+    setStatus('uploading segment...');
+    setError('');
+
+    // Stop recorder to force a clean segment file boundary (fixes invalid/0s segments on toggles)
+    await stopRecorderAndWait(rec);
+
+    // Build blob AFTER stop so it includes the final chunk
     const parts = segmentChunksRef.current;
     segmentChunksRef.current = [];
 
@@ -109,19 +162,31 @@ export default function Recorder() {
 
     const duration = end_ms - start_ms;
 
-    // Do not upload segments that are basically empty or too short
-    if (!hasAudio || parts.length === 0 || duration < 1000) {
+    if (!hasAudio || parts.length === 0 || duration < 200) {
       segmentStartMsRef.current = end_ms;
+
+      if (restartAfter && stream) {
+        const newRec = createRecorder(stream);
+        recorderRef.current = newRec;
+
+        newRec.ondataavailable = (evt) => {
+          if (!evt.data || evt.data.size === 0) return;
+          hasAnyAudioRef.current = true;
+          segmentChunksRef.current.push(evt.data);
+        };
+
+        newRec.onerror = () => setError('recorder error');
+        newRec.start(250);
+      } else {
+        recorderRef.current = null;
+      }
+
+      setStatus('');
       return;
     }
 
-    const blob = new Blob(parts, { type: 'audio/webm' });
-
-    // Do not upload tiny blobs (these often end up as 0 seconds / invalid audio)
-    if (blob.size < 15000) {
-      segmentStartMsRef.current = end_ms;
-      return;
-    }
+    const blobType = rec.mimeType || pickMimeType() || 'audio/webm';
+    const blob = new Blob(parts, { type: blobType });
 
     const meta = {
       session_id: sid,
@@ -130,13 +195,11 @@ export default function Recorder() {
       end_ms,
     };
 
-    setStatus('uploading segment...');
-    setError('');
-
     try {
       const form = new FormData();
       form.append('metadata_json', JSON.stringify(meta));
-      const ext = blob.type.includes('ogg') ? 'ogg' : 'webm';
+
+      const ext = extFromMime(blobType);
       form.append('file', blob, `segment-${start_ms}-${end_ms}.${ext}`);
 
       const res = await fetch(`${backendBase}/api/upload-chunk`, {
@@ -174,8 +237,24 @@ export default function Recorder() {
         },
       ]);
     } finally {
-      setStatus('');
       segmentStartMsRef.current = end_ms;
+      setStatus('');
+    }
+
+    if (restartAfter && stream) {
+      const newRec = createRecorder(stream);
+      recorderRef.current = newRec;
+
+      newRec.ondataavailable = (evt) => {
+        if (!evt.data || evt.data.size === 0) return;
+        hasAnyAudioRef.current = true;
+        segmentChunksRef.current.push(evt.data);
+      };
+
+      newRec.onerror = () => setError('recorder error');
+      newRec.start(250);
+    } else {
+      recorderRef.current = null;
     }
   }
 
@@ -192,16 +271,7 @@ export default function Recorder() {
       const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
       mediaStreamRef.current = stream;
 
-      const preferredTypes = [
-        'audio/webm;codecs=opus',
-        'audio/webm',
-        'audio/ogg;codecs=opus',
-        'audio/ogg',
-      ];
-
-      const pickedType = preferredTypes.find((t) => MediaRecorder.isTypeSupported(t)) || '';
-      const rec = new MediaRecorder(stream, pickedType ? { mimeType: pickedType } : undefined);
-
+      const rec = createRecorder(stream);
       recorderRef.current = rec;
 
       segmentChunksRef.current = [];
@@ -240,7 +310,7 @@ export default function Recorder() {
     const nextLang: Lang = currentLang === 'en' ? 'zh' : 'en';
 
     setStatus('finalizing segment...');
-    await flushCurrentSegment(currentLang);
+    await flushCurrentSegment(currentLang, true);
 
     setLanguage(nextLang);
     setStatus('');
@@ -259,7 +329,7 @@ export default function Recorder() {
     setError('');
 
     try {
-      await flushCurrentSegment(language);
+      await flushCurrentSegment(language, false);
     } finally {
       tryStopRecorder();
       tryStopTracks();
@@ -285,7 +355,7 @@ export default function Recorder() {
         return `${tag} ${t}`.trim();
       })
       .filter(Boolean)
-      .join("\n");
+      .join('\n');
   }, [segments]);
 
   const langLabel = language === 'en' ? 'English' : 'Mandarin';
