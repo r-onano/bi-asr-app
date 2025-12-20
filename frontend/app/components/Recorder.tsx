@@ -108,12 +108,21 @@ export default function Recorder() {
     hasAnyAudioRef.current = false;
 
     const duration = end_ms - start_ms;
-    if (!hasAudio || parts.length === 0 || duration < 200) {
+
+    // Do not upload segments that are basically empty or too short
+    if (!hasAudio || parts.length === 0 || duration < 1000) {
       segmentStartMsRef.current = end_ms;
       return;
     }
 
     const blob = new Blob(parts, { type: 'audio/webm' });
+
+    // Do not upload tiny blobs (these often end up as 0 seconds / invalid audio)
+    if (blob.size < 15000) {
+      segmentStartMsRef.current = end_ms;
+      return;
+    }
+
     const meta = {
       session_id: sid,
       language_code: langForSegment,
@@ -127,7 +136,8 @@ export default function Recorder() {
     try {
       const form = new FormData();
       form.append('metadata_json', JSON.stringify(meta));
-      form.append('file', blob, `segment-${start_ms}-${end_ms}.webm`);
+      const ext = blob.type.includes('ogg') ? 'ogg' : 'webm';
+      form.append('file', blob, `segment-${start_ms}-${end_ms}.${ext}`);
 
       const res = await fetch(`${backendBase}/api/upload-chunk`, {
         method: 'POST',
@@ -182,7 +192,16 @@ export default function Recorder() {
       const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
       mediaStreamRef.current = stream;
 
-      const rec = new MediaRecorder(stream, { mimeType: 'audio/webm' });
+      const preferredTypes = [
+        'audio/webm;codecs=opus',
+        'audio/webm',
+        'audio/ogg;codecs=opus',
+        'audio/ogg',
+      ];
+
+      const pickedType = preferredTypes.find((t) => MediaRecorder.isTypeSupported(t)) || '';
+      const rec = new MediaRecorder(stream, pickedType ? { mimeType: pickedType } : undefined);
+
       recorderRef.current = rec;
 
       segmentChunksRef.current = [];

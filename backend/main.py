@@ -77,6 +77,7 @@ async def upload_chunk(
         raise HTTPException(status_code=400, detail="Missing session_id")
 
     blob = await file.read()
+    print("upload_chunk:", "bytes=", len(blob), "content_type=", file.content_type, "filename=", file.filename)
     if not blob:
         raise HTTPException(status_code=400, detail="Empty audio blob")
 
